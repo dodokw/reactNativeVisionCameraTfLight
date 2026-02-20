@@ -3,7 +3,8 @@ import { Pressable, ViewStyle, StyleProp } from 'react-native';
 import Animated, {
   useAnimatedStyle,
   useSharedValue,
-  withSpring,
+  withTiming,
+  Easing,
 } from 'react-native-reanimated';
 
 interface BouncyButtonProps {
@@ -28,16 +29,18 @@ export const BouncyButton = ({
   });
 
   const handlePressIn = () => {
-    scale.value = withSpring(0.95, {
-      damping: 10,
-      stiffness: 200,
+    // 버튼 모양이 쫀득하게 작아지도록 짧은 시간(100ms)과 ease 효과를 줍니다.
+    scale.value = withTiming(0.96, {
+      duration: 100,
+      easing: Easing.out(Easing.ease),
     });
   };
 
   const handlePressOut = () => {
-    scale.value = withSpring(1, {
-      damping: 10,
-      stiffness: 200,
+    // 손을 떼었을 때 원래 크기로 자연스럽게 복구됩니다 (150ms).
+    scale.value = withTiming(1, {
+      duration: 150,
+      easing: Easing.out(Easing.ease),
     });
   };
 

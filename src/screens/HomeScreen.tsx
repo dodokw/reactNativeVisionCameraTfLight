@@ -7,6 +7,30 @@ import { setFirstLaunch } from '../store/slices/appSlice';
 
 import { BouncyButton } from '../components/BouncyButton';
 
+export const HomeScreen = () => {
+  const isFirstLaunch = useSelector(
+    (state: RootState) => state.app.isFirstLaunch,
+  );
+  const dispatch = useDispatch<AppDispatch>();
+
+  const toggleFirstLaunch = () => {
+    dispatch(setFirstLaunch(!isFirstLaunch));
+  };
+
+  return (
+    <Container>
+      <Title>TFLite & Redux App</Title>
+      <InfoText>First Launch State: {isFirstLaunch ? 'Yes' : 'No'}</InfoText>
+
+      <BouncyButton onPress={toggleFirstLaunch}>
+        <StyledButtonContent>
+          <ButtonText>Toggle State (Test Persist)</ButtonText>
+        </StyledButtonContent>
+      </BouncyButton>
+    </Container>
+  );
+};
+
 const Container = styled(SafeAreaView)`
   flex: 1;
   background-color: #f5f5f5;
@@ -38,27 +62,3 @@ const ButtonText = styled(Text)`
   font-size: 16px;
   font-weight: bold;
 `;
-
-export const HomeScreen = () => {
-  const isFirstLaunch = useSelector(
-    (state: RootState) => state.app.isFirstLaunch,
-  );
-  const dispatch = useDispatch<AppDispatch>();
-
-  const toggleFirstLaunch = () => {
-    dispatch(setFirstLaunch(!isFirstLaunch));
-  };
-
-  return (
-    <Container>
-      <Title>TFLite & Redux App</Title>
-      <InfoText>First Launch State: {isFirstLaunch ? 'Yes' : 'No'}</InfoText>
-
-      <BouncyButton onPress={toggleFirstLaunch}>
-        <StyledButtonContent>
-          <ButtonText>Toggle State (Test Persist)</ButtonText>
-        </StyledButtonContent>
-      </BouncyButton>
-    </Container>
-  );
-};
