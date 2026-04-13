@@ -3,6 +3,7 @@ import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { HomeScreen } from '../screens/HomeScreen';
 import { CameraScreen } from '../screens/CameraScreen';
 import { SettingsScreen } from '../screens/SettingsScreen';
+import { ExerciseListScreen } from '../screens/ExerciseListScreen';
 
 const Tab = createBottomTabNavigator();
 
@@ -20,10 +21,16 @@ export const TabNavigator = () => {
         component={HomeScreen}
         options={{ tabBarLabel: 'Home' }}
       />
+      {/* CameraScreen */}
       <Tab.Screen
-        name="Camera"
+        name="CameraScreen"
         component={CameraScreen}
-        options={{ tabBarLabel: 'Camera' }}
+        options={{ tabBarLabel: 'CameraScreen' }}
+      />
+      <Tab.Screen
+        name="ExerciseListScreen"
+        component={ExerciseListScreen}
+        options={{ tabBarLabel: 'ExerciseListScreen' }}
       />
       <Tab.Screen
         name="Settings"

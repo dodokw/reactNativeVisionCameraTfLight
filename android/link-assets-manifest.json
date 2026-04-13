@@ -1,0 +1,17 @@
+{
+  "migIndex": 1,
+  "data": [
+    {
+      "path": "src/assets/font/SpoqaHanSansNeo-Bold.ttf",
+      "sha1": "cb7dc0e5047cf54e5c2a201d02256a6357ffd36f"
+    },
+    {
+      "path": "src/assets/font/SpoqaHanSansNeo-Light.ttf",
+      "sha1": "dcc99a8ec77d521edcfcd571df16efd400b269bd"
+    },
+    {
+      "path": "src/assets/font/SpoqaHanSansNeo-Regular.ttf",
+      "sha1": "c00e1b380dab850ca8631085db53a0b97820a1af"
+    }
+  ]
+}
