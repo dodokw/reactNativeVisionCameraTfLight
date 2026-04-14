@@ -86,7 +86,7 @@ interface PoseOverlayProps {
  * 2. 화면 좌표로 변환: normalizedCoord * screenDimension
  * 3. 전면 카메라일 경우 X축 미러링
  */
-export const PoseOverlay: React.FC<PoseOverlayProps> = ({
+const PoseOverlayInner: React.FC<PoseOverlayProps> = ({
   keypoints,
   width,
   height,
@@ -141,21 +141,12 @@ export const PoseOverlay: React.FC<PoseOverlayProps> = ({
         );
       })}
 
-      {/* 2. 키포인트 원 */}
+      {/* 2. 키포인트 원 — 단일 원만 사용 (외부 글로우 제거로 SVG 요소 절반 감소) */}
       {transformedKeypoints.map((kp, idx) => {
         if (!kp.visible) return null;
 
         return (
           <React.Fragment key={`kp-${idx}`}>
-            <Circle
-              cx={kp.x}
-              cy={kp.y}
-              r={8}
-              fill="none"
-              stroke={getKeypointColor(idx)}
-              strokeWidth={2}
-              strokeOpacity={0.4}
-            />
             <Circle
               cx={kp.x}
               cy={kp.y}
@@ -182,3 +173,6 @@ export const PoseOverlay: React.FC<PoseOverlayProps> = ({
     </Svg>
   );
 };
+
+// React.memo로 감싸서 동일한 키포인트일 때 리렌더 방지
+export const PoseOverlay = React.memo(PoseOverlayInner);

@@ -1,4 +1,5 @@
 import React, { createContext, useContext, ReactNode } from 'react';
+import { Platform } from 'react-native';
 import { useTensorflowModel } from 'react-native-nitro-tflite';
 
 type ModelState = 'loading' | 'loaded' | 'error' | undefined;
@@ -16,6 +17,7 @@ const ModelContext = createContext<ModelContextProps>({
 export const ModelProvider = ({ children }: { children: ReactNode }) => {
   const { model, state } = useTensorflowModel(
     require('../assets/models/yolo26n-pose.tflite'),
+    Platform.OS === 'ios' ? 'metal' : 'default',
   );
 
   return (

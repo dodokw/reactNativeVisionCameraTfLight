@@ -1,5 +1,5 @@
 import React from 'react';
-import { View, Text, SafeAreaView } from 'react-native';
+import { View, Text } from 'react-native';
 import styled from 'styled-components/native';
 import { useSelector, useDispatch } from 'react-redux';
 import { RootState, AppDispatch } from '../store';
@@ -39,7 +39,7 @@ export const HomeScreen = () => {
   );
 };
 
-const Container = styled(SafeAreaView)`
+const Container = styled(View)`
   flex: 1;
   background-color: #f5f5f5;
   align-items: center;
