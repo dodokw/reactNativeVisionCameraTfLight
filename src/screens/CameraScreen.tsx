@@ -6,7 +6,6 @@ import React, {
   useState,
 } from 'react';
 import {
-  Alert,
   StatusBar,
   StyleSheet,
   useWindowDimensions,
@@ -22,25 +21,30 @@ import { useSharedValue, Worklets } from 'react-native-worklets-core';
 import { useResizePlugin } from 'vision-camera-resize-plugin';
 import { useModel } from '../contexts/ModelContext';
 import styled from 'styled-components/native';
-import { useFocusEffect, useRoute } from '@react-navigation/native';
+import { useFocusEffect, useNavigation, useRoute } from '@react-navigation/native';
 import type { RouteProp } from '@react-navigation/native';
-import { useDispatch } from 'react-redux';
+import { useDispatch, useSelector } from 'react-redux';
+import { CustomAlertModal } from '../components/CustomAlertModal';
 import { PoseOverlay, Keypoint } from '../components/PoseOverlay';
 import { RppgVitalsHud } from '../components/RppgVitalsHud';
 import { Colors } from '../tools/Colors';
 import { TextB, TextR } from '../tools/fonts';
 import { fallbackExercises } from '../data/exerciseCatalog';
-import type { NoTabStackParamList } from '../navigation/types';
+import type {
+  NoTabStackNavigation,
+  NoTabStackParamList,
+  RootStackNavigation,
+} from '../navigation/types';
+import type { RootState } from '../store';
 import { addCompletedWorkout } from '../store/slices/activitySlice';
 import { parseCalories } from '../utils/activityCalories';
 import type { ExerciseRepState } from '../utils/exerciseCounters';
 import {
   countExerciseRep,
-  getCountableExerciseId,
   getExerciseCounterGuide,
 } from '../utils/exerciseCounters';
 import {
-  processRppgOutput,
+  processRppgSample,
   resetBvpHistory,
 } from '../utils/rppgSignalProcessing';
 import type { RppgVitals } from '../utils/rppgSignalProcessing';
@@ -234,19 +238,30 @@ const CompleteWorkoutButton = styled.TouchableOpacity`
   background-color: ${KINETIC_COLORS.primary};
 `;
 
+const SecondaryActionButton = styled.TouchableOpacity`
+  min-height: 48px;
+  border-radius: 16px;
+  margin-top: 10px;
+  justify-content: center;
+  align-items: center;
+  border-width: 1px;
+  border-color: rgba(255, 255, 255, 0.16);
+  background-color: rgba(255, 255, 255, 0.04);
+`;
+
 const DEFAULT_REP_GOAL = 20;
+const MEASUREMENT_DURATION_MS = 20000;
+const FACE_KEYPOINT_SCORE_THRESHOLD = 0.35;
+const FACE_BOX_EXPANSION = 1.8;
+const MIN_FACE_BOX_SIZE = 0.18;
 
 // 모델 입력 크기: 576×320 (9:16 세로 비율)
 const MODEL_INPUT_HEIGHT = 576;
 const MODEL_INPUT_WIDTH = 320;
 
-// rPPG/TSCAN 입력: float32 [1, 576, 320, 3, 10].
-// Pose 모델과 동일한 해상도(576×320)를 사용하므로 resize 결과를 공유.
-const RPPG_FRAME_COUNT = 10;
-const RPPG_FRAME_VALUES = MODEL_INPUT_HEIGHT * MODEL_INPUT_WIDTH * 3;
-const RPPG_BATCH_VALUES = RPPG_FRAME_COUNT * RPPG_FRAME_VALUES;
-const RPPG_SAMPLE_INTERVAL_MS = 250; // 4Hz
-const RPPG_POSE_SKIP_MODULO = 3;
+// CHROM rPPG 입력: 얼굴 crop 36×36의 RGB 평균값.
+const RPPG_CROP_SIZE = 36;
+const RPPG_SAMPLE_INTERVAL_MS = 100; // ~10Hz 수집 (실제 샘플 시간은 별도 전달)
 const RPPG_DEBUG_LOGGING = false;
 
 // ── YOLO output 상수 ──────────────────────────────────────────────
@@ -259,13 +274,237 @@ const CONF_THRESHOLD = 0.5;
 // 이 값을 높이면 메모리 사용량 감소, 스켈레톤 업데이트 느려짐
 const UI_POLL_INTERVAL_MS = 250; // ~4FPS 렌더링
 
+type CameraPhase =
+  | 'pre-ready'
+  | 'pre-measuring'
+  | 'workout'
+  | 'post-ready'
+  | 'post-measuring'
+  | 'results';
+type MeasurementKind = 'pre' | 'post';
+
+type AlertConfig = {
+  visible: boolean;
+  title: string;
+  message: string;
+  confirmText?: string;
+  cancelText?: string;
+  onConfirm?: () => void;
+  onCancel?: () => void;
+};
+
+interface FaceRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+const FACE_KEYPOINT_INDICES = [0, 1, 2, 3, 4];
+
+function clamp(value: number, min: number, max: number): number {
+  'worklet';
+  return Math.min(Math.max(value, min), max);
+}
+
+function getFaceRectFromKeypoints(flat: number[]): FaceRect | null {
+  'worklet';
+  let minX = 1;
+  let minY = 1;
+  let maxX = 0;
+  let maxY = 0;
+  let validCount = 0;
+
+  for (const index of FACE_KEYPOINT_INDICES) {
+    const offset = index * 3;
+    const x = flat[offset];
+    const y = flat[offset + 1];
+    const score = flat[offset + 2];
+
+    if (
+      x == null ||
+      y == null ||
+      score == null ||
+      !Number.isFinite(x) ||
+      !Number.isFinite(y) ||
+      !Number.isFinite(score) ||
+      score < FACE_KEYPOINT_SCORE_THRESHOLD
+    ) {
+      continue;
+    }
+
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x);
+    maxY = Math.max(maxY, y);
+    validCount += 1;
+  }
+
+  if (validCount < 3) {
+    return null;
+  }
+
+  const centerX = (minX + maxX) / 2;
+  const centerY = (minY + maxY) / 2;
+  const size = Math.max(maxX - minX, maxY - minY, MIN_FACE_BOX_SIZE);
+  const expandedSize = size * FACE_BOX_EXPANSION;
+  const half = expandedSize / 2;
+
+  const boxSize = clamp(expandedSize, MIN_FACE_BOX_SIZE, 1);
+  const x = clamp(centerX - half, 0, 1 - boxSize);
+  const y = clamp(centerY - half, 0, 1 - boxSize);
+
+  if (boxSize <= 0) {
+    return null;
+  }
+
+  return {x, y, width: boxSize, height: boxSize};
+}
+
+function getRppgRoiFromFaceRect(faceRect: FaceRect): FaceRect {
+  'worklet';
+
+  const width = faceRect.width * 0.56;
+  const height = faceRect.height * 0.46;
+  const x = clamp(faceRect.x + faceRect.width * 0.22, 0, 1 - width);
+  const y = clamp(faceRect.y + faceRect.height * 0.24, 0, 1 - height);
+
+  return {x, y, width, height};
+}
+
+function getFrameCropFromModelRect(
+  rect: FaceRect,
+  orientation: string,
+  frameWidth: number,
+  frameHeight: number,
+): FaceRect {
+  'worklet';
+
+  const isLandscape =
+    orientation === 'landscape-left' || orientation === 'landscape-right';
+  const scaleWidth = isLandscape ? MODEL_INPUT_HEIGHT : MODEL_INPUT_WIDTH;
+  const scaleHeight = isLandscape ? MODEL_INPUT_WIDTH : MODEL_INPUT_HEIGHT;
+  const targetAspectRatio = scaleWidth / scaleHeight;
+  const frameAspectRatio = frameWidth / frameHeight;
+
+  let sourceX = 0;
+  let sourceY = 0;
+  let sourceWidth = frameWidth;
+  let sourceHeight = frameHeight;
+
+  if (frameAspectRatio > targetAspectRatio) {
+    sourceWidth = frameHeight * targetAspectRatio;
+    sourceX = (frameWidth - sourceWidth) / 2;
+  } else {
+    sourceHeight = frameWidth / targetAspectRatio;
+    sourceY = (frameHeight - sourceHeight) / 2;
+  }
+
+  const mirror = orientation === 'landscape-right';
+  const corners = [
+    [rect.x, rect.y],
+    [rect.x + rect.width, rect.y],
+    [rect.x, rect.y + rect.height],
+    [rect.x + rect.width, rect.y + rect.height],
+  ];
+  let minX = frameWidth;
+  let minY = frameHeight;
+  let maxX = 0;
+  let maxY = 0;
+
+  for (const corner of corners) {
+    let outX = corner[0] as number;
+    const outY = corner[1] as number;
+    if (mirror) {
+      outX = 1 - outX;
+    }
+
+    let scaledX = outX * scaleWidth;
+    let scaledY = outY * scaleHeight;
+
+    if (orientation === 'landscape-right') {
+      scaledX = outY * scaleWidth;
+      scaledY = (1 - outX) * scaleHeight;
+    } else if (orientation === 'landscape-left') {
+      scaledX = (1 - outY) * scaleWidth;
+      scaledY = outX * scaleHeight;
+    } else if (orientation === 'portrait-upside-down') {
+      scaledX = (1 - outX) * scaleWidth;
+      scaledY = (1 - outY) * scaleHeight;
+    }
+
+    const rawX = sourceX + (scaledX / scaleWidth) * sourceWidth;
+    const rawY = sourceY + (scaledY / scaleHeight) * sourceHeight;
+    minX = Math.min(minX, rawX);
+    minY = Math.min(minY, rawY);
+    maxX = Math.max(maxX, rawX);
+    maxY = Math.max(maxY, rawY);
+  }
+
+  minX = clamp(minX, 0, frameWidth - 1);
+  minY = clamp(minY, 0, frameHeight - 1);
+  maxX = clamp(maxX, minX + 1, frameWidth);
+  maxY = clamp(maxY, minY + 1, frameHeight);
+
+  return {
+    x: minX,
+    y: minY,
+    width: maxX - minX,
+    height: maxY - minY,
+  };
+}
+
+function calculateRgbMeans(source: Float32Array | Uint8Array): number[] {
+  'worklet';
+
+  let red = 0;
+  let green = 0;
+  let blue = 0;
+  let count = 0;
+
+  for (let i = 0; i + 2 < source.length; i += 3) {
+    const r = source[i] as number;
+    const g = source[i + 1] as number;
+    const b = source[i + 2] as number;
+    const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+
+    if (
+      !Number.isFinite(r) ||
+      !Number.isFinite(g) ||
+      !Number.isFinite(b) ||
+      luma < 35 ||
+      luma > 245
+    ) {
+      continue;
+    }
+
+    red += r;
+    green += g;
+    blue += b;
+    count += 1;
+  }
+
+  if (count === 0) {
+    return [];
+  }
+
+  return [red / count, green / count, blue / count];
+}
+
 export const CameraScreen = () => {
   const dispatch = useDispatch();
+  const navigation = useNavigation<NoTabStackNavigation>();
+  const rootNavigation = navigation.getParent<RootStackNavigation>();
+  const isRppgEnabled = useSelector(
+    (state: RootState) => state.app.isRppgEnabled,
+  );
   const route = useRoute<RouteProp<NoTabStackParamList, 'Camera'>>();
   const sessionStartedAtRef = useRef<number | null>(null);
+  const latestVitalsRef = useRef<RppgVitals | null>(null);
   const workoutExerciseIds = route.params.exerciseIds;
+  const [currentExerciseIndex, setCurrentExerciseIndex] = useState(0);
   const activeExerciseId =
-    getCountableExerciseId(workoutExerciseIds) ?? workoutExerciseIds[0];
+    workoutExerciseIds[currentExerciseIndex] ?? workoutExerciseIds[0];
   const activeExercise =
     fallbackExercises.find(exercise => exercise.id === activeExerciseId) ??
     fallbackExercises[0];
@@ -277,14 +516,17 @@ export const CameraScreen = () => {
   ]);
   const { width: screenWidth, height: screenHeight } = useWindowDimensions();
 
-  const { model, rppgModel } = useModel();
+  const { model } = useModel();
   const { resize } = useResizePlugin();
 
-  const lastLogTime = useSharedValue(0);
-  // ⚠️ SharedValue는 Float32Array를 지원하지 않음!
-  //    → 배치 버퍼는 worklet global에 유지 (아래 frame processor 참조)
-  const rppgFrameSlot = useSharedValue(0);
+  const lastPoseInferenceTime = useSharedValue(0);
+  const rppgSampleCount = useSharedValue(0);
   const rppgLastCollectTime = useSharedValue(0);
+  const cameraPhaseValue = useSharedValue<CameraPhase>('pre-ready');
+  const measurementFaceRect = useSharedValue<number[]>([]);
+  const measurementFaceLocked = useSharedValue(false);
+  const measurementDeadline = useSharedValue(0);
+  const measurementWindowCount = useSharedValue(0);
   const repCount = useSharedValue(0);
   const repState = useSharedValue('UNKNOWN');
   const prevDetected = useSharedValue(false);
@@ -304,16 +546,39 @@ export const CameraScreen = () => {
   );
   const [displayRepCount, setDisplayRepCount] = useState(0);
   const [detectionState, setDetectionState] = useState<string>('대기 중...');
+  const [cameraPhase, setCameraPhase] = useState<CameraPhase>('pre-ready');
   const [rppgVitals, setRppgVitals] = useState<RppgVitals | null>(null);
   const [rppgFrameProgress, setRppgFrameProgress] = useState('대기 중');
+  const [preMeasurementVitals, setPreMeasurementVitals] =
+    useState<RppgVitals | null>(null);
+  const [postMeasurementVitals, setPostMeasurementVitals] =
+    useState<RppgVitals | null>(null);
+  const [alertConfig, setAlertConfig] = useState<AlertConfig>({
+    visible: false,
+    title: '',
+    message: '',
+  });
+
+  const closeAlert = useCallback(() => {
+    setAlertConfig(prev => ({ ...prev, visible: false }));
+  }, []);
+
+  const showAlert = useCallback((config: Omit<AlertConfig, 'visible'>) => {
+    setAlertConfig({
+      visible: true,
+      ...config,
+    });
+  }, []);
 
   const completeWorkout = useCallback(() => {
     if (displayRepCount <= 0) {
-      Alert.alert(
-        '운동 기록',
-        '반복 횟수가 1회 이상일 때 완료로 기록할 수 있어요.',
-      );
-      return;
+      showAlert({
+        title: '운동 기록',
+        message: '반복 횟수가 1회 이상일 때 완료로 기록할 수 있어요.',
+        confirmText: '확인',
+        onConfirm: closeAlert,
+      });
+      return false;
     }
 
     const baseCalories = parseCalories(activeExercise.calories);
@@ -347,31 +612,228 @@ export const CameraScreen = () => {
     repState.value = 'UNKNOWN';
     sessionStartedAtRef.current = Date.now();
     setDisplayRepCount(0);
+    setPreMeasurementVitals(null);
+    setPostMeasurementVitals(null);
+    latestVitalsRef.current = null;
+    return true;
+  }, [
+    activeExercise,
+    closeAlert,
+    dispatch,
+    displayRepCount,
+    repCount,
+    repState,
+    showAlert,
+  ]);
 
-    Alert.alert(
-      '운동 완료',
-      `${activeExercise.name} ${displayRepCount}회를 기록했어요.`,
-    );
-  }, [activeExercise, dispatch, displayRepCount, repCount, repState]);
+  const startMeasurementPhase = useCallback(
+    (kind: MeasurementKind) => {
+      const nextPhase: CameraPhase =
+        kind === 'pre' ? 'pre-measuring' : 'post-measuring';
+      cameraPhaseValue.value = nextPhase;
+      measurementFaceRect.value = [];
+      measurementFaceLocked.value = false;
+      measurementDeadline.value = 0;
+      measurementWindowCount.value = 0;
+      rppgSampleCount.value = 0;
+      rppgLastCollectTime.value = 0;
+      prevDetected.value = false;
+      latestVitalsRef.current = null;
+      setCameraPhase(nextPhase);
+      setCurrentKeypoints(null);
+      setDetectionState('얼굴 정렬 중');
+      setRppgVitals(null);
+      setRppgFrameProgress('얼굴 위치 확인 중');
+      resetBvpHistory();
+    },
+    [
+      cameraPhaseValue,
+      measurementDeadline,
+      measurementFaceLocked,
+      measurementFaceRect,
+      measurementWindowCount,
+      prevDetected,
+      rppgLastCollectTime,
+      rppgSampleCount,
+    ],
+  );
+
+  const startWorkoutPhase = useCallback(() => {
+    cameraPhaseValue.value = 'workout';
+    measurementFaceRect.value = [];
+    measurementFaceLocked.value = false;
+    measurementDeadline.value = 0;
+    measurementWindowCount.value = 0;
+    rppgSampleCount.value = 0;
+    rppgLastCollectTime.value = 0;
+    prevDetected.value = false;
+    latestVitalsRef.current = null;
+    setCameraPhase('workout');
+    setCurrentKeypoints(null);
+    setDetectionState('운동 자세 분석 중');
+    setRppgVitals(null);
+    setRppgFrameProgress('운동 중 rPPG 비활성');
+  }, [
+    cameraPhaseValue,
+    measurementDeadline,
+    measurementFaceLocked,
+    measurementFaceRect,
+    measurementWindowCount,
+    prevDetected,
+    rppgLastCollectTime,
+    rppgSampleCount,
+  ]);
+
+  const startReadyPhase = useCallback(
+    (kind: MeasurementKind) => {
+      const nextPhase: CameraPhase = kind === 'pre' ? 'pre-ready' : 'post-ready';
+      cameraPhaseValue.value = nextPhase;
+      measurementFaceRect.value = [];
+      measurementFaceLocked.value = false;
+      measurementDeadline.value = 0;
+      measurementWindowCount.value = 0;
+      rppgSampleCount.value = 0;
+      rppgLastCollectTime.value = 0;
+      prevDetected.value = false;
+      latestVitalsRef.current = null;
+      setCameraPhase(nextPhase);
+      setCurrentKeypoints(null);
+      setDetectionState('측정 대기');
+      setRppgVitals(null);
+      setRppgFrameProgress('안내 확인 필요');
+      resetBvpHistory();
+    },
+    [
+      cameraPhaseValue,
+      measurementDeadline,
+      measurementFaceLocked,
+      measurementFaceRect,
+      measurementWindowCount,
+      prevDetected,
+      rppgLastCollectTime,
+      rppgSampleCount,
+    ],
+  );
+
+  const startResultsPhase = useCallback(() => {
+    cameraPhaseValue.value = 'results';
+    measurementDeadline.value = 0;
+    measurementFaceLocked.value = false;
+    measurementFaceRect.value = [];
+    measurementWindowCount.value = 0;
+    rppgSampleCount.value = 0;
+    rppgLastCollectTime.value = 0;
+    setCameraPhase('results');
+    setCurrentKeypoints(null);
+    setDetectionState('측정 완료');
+  }, [
+    cameraPhaseValue,
+    measurementDeadline,
+    measurementFaceLocked,
+    measurementFaceRect,
+    measurementWindowCount,
+    rppgLastCollectTime,
+    rppgSampleCount,
+  ]);
+
+  const prepareExerciseSession = useCallback(() => {
+    repCount.value = 0;
+    repState.value = 'UNKNOWN';
+    prevDetected.value = false;
+    flatKeypoints.value = [];
+    keypointsDirty.value = false;
+    detectedState.value = 0;
+    sessionStartedAtRef.current = Date.now();
+    setDisplayRepCount(0);
+    setCurrentKeypoints(null);
+    setRppgVitals(null);
+    setPreMeasurementVitals(null);
+    setPostMeasurementVitals(null);
+    latestVitalsRef.current = null;
+
+    if (isRppgEnabled) {
+      startReadyPhase('pre');
+      return;
+    }
+
+    startWorkoutPhase();
+  }, [
+    detectedState,
+    flatKeypoints,
+    isRppgEnabled,
+    keypointsDirty,
+    prevDetected,
+    repCount,
+    repState,
+    startReadyPhase,
+    startWorkoutPhase,
+  ]);
+
+  const moveToNextExercise = useCallback(() => {
+    closeAlert();
+    setCurrentExerciseIndex(prev => prev + 1);
+    prepareExerciseSession();
+  }, [closeAlert, prepareExerciseSession]);
+
+  const finishWorkoutFlow = useCallback(() => {
+    closeAlert();
+    rootNavigation?.goBack();
+  }, [closeAlert, rootNavigation]);
 
   // 반복 카운트만 즉시 전달 (빈도 낮음 — 운동 1회가 완성될 때만)
   const updateRepCount = useMemo(
     () => Worklets.createRunOnJS(setDisplayRepCount),
     [],
   );
-  const updateRppgFrameProgress = useMemo(
-    () => Worklets.createRunOnJS(setRppgFrameProgress),
-    [],
-  );
-  const updateRppgVitals = useMemo(
+  const updateMeasurementVitals = useMemo(
     () =>
-      Worklets.createRunOnJS((rawValues: number[]) => {
-        const vitals = processRppgOutput(rawValues);
-        if (vitals) {
-          setRppgVitals(vitals);
+      Worklets.createRunOnJS((rgbValues: number[]) => {
+        const [meanR, meanG, meanB, capturedAtMs] = rgbValues;
+        if (
+          meanR == null ||
+          meanG == null ||
+          meanB == null ||
+          capturedAtMs == null ||
+          !Number.isFinite(meanR) ||
+          !Number.isFinite(meanG) ||
+          !Number.isFinite(meanB) ||
+          !Number.isFinite(capturedAtMs)
+        ) {
+          return;
         }
+
+        if (RPPG_DEBUG_LOGGING) {
+          console.log(
+            `[rPPG JS] RGB mean r=${meanR.toFixed(2)}, g=${meanG.toFixed(2)}, b=${meanB.toFixed(2)}`,
+          );
+        }
+        const vitals = processRppgSample(meanR, meanG, meanB, capturedAtMs);
+        if (RPPG_DEBUG_LOGGING && vitals) {
+          console.log(
+            `[rPPG JS] HR=${vitals.heartRate} RR=${vitals.respirationRate} quality=${vitals.signalQuality.toFixed(3)} hasData=${vitals.hasEnoughData}`,
+          );
+        }
+        latestVitalsRef.current = vitals;
+        setRppgVitals(vitals);
       }),
     [],
+  );
+  const finishMeasurement = useMemo(
+    () =>
+      Worklets.createRunOnJS((kind: MeasurementKind, windowCount: number) => {
+        const latestVitals = latestVitalsRef.current;
+        if (kind === 'pre') {
+          setPreMeasurementVitals(latestVitals);
+          setRppgFrameProgress(`측정 완료 · ${windowCount}개 샘플`);
+          startWorkoutPhase();
+          return;
+        }
+
+        setPostMeasurementVitals(latestVitals);
+        setRppgFrameProgress(`측정 완료 · ${windowCount}개 샘플`);
+        startResultsPhase();
+      }),
+    [startResultsPhase, startWorkoutPhase],
   );
 
   // ── JS 측 폴링: SharedValue → React 상태 ──────────────────────
@@ -394,8 +856,23 @@ export const CameraScreen = () => {
         detectedState.value = 0;
       }
 
+      const phase = cameraPhaseValue.value;
+      if (phase === 'pre-measuring' || phase === 'post-measuring') {
+        if (!measurementFaceLocked.value) {
+          setRppgFrameProgress('얼굴 위치 확인 중');
+        } else {
+          const remainingMs = Math.max(0, measurementDeadline.value - Date.now());
+          const remainingSec = Math.ceil(remainingMs / 1000);
+          setRppgFrameProgress(
+            `${Math.max(0, remainingSec)}초 남음 · ${rppgSampleCount.value}개 RGB 샘플`,
+          );
+        }
+      }
+
       // 키포인트 데이터 확인
-      if (!keypointsDirty.value) return;
+      if (!keypointsDirty.value) {
+        return;
+      }
       keypointsDirty.value = false;
 
       const flat = flatKeypoints.value;
@@ -417,25 +894,57 @@ export const CameraScreen = () => {
     }, UI_POLL_INTERVAL_MS);
 
     return () => clearInterval(intervalId);
-  }, [active, flatKeypoints, keypointsDirty, detectedState]);
+  }, [
+    active,
+    cameraPhaseValue,
+    detectedState,
+    flatKeypoints,
+    keypointsDirty,
+    measurementDeadline,
+    measurementFaceLocked,
+    measurementWindowCount,
+    rppgSampleCount,
+  ]);
 
   useFocusEffect(
     useCallback(() => {
       if (!hasPermission) {
         requestPermission();
       }
-      sessionStartedAtRef.current = Date.now();
       setActive(true);
+      setCurrentExerciseIndex(0);
+      prepareExerciseSession();
       return () => {
         setActive(false);
         sessionStartedAtRef.current = null;
         setCurrentKeypoints(null);
         setRppgVitals(null);
+        setPreMeasurementVitals(null);
+        setPostMeasurementVitals(null);
         setRppgFrameProgress('대기 중');
         resetBvpHistory();
-        rppgFrameSlot.value = 0;
+        latestVitalsRef.current = null;
+        setCurrentExerciseIndex(0);
+        cameraPhaseValue.value = 'pre-ready';
+        measurementDeadline.value = 0;
+        measurementFaceLocked.value = false;
+        measurementFaceRect.value = [];
+        measurementWindowCount.value = 0;
+        rppgLastCollectTime.value = 0;
+        rppgSampleCount.value = 0;
       };
-    }, [hasPermission, requestPermission, rppgFrameSlot]),
+    }, [
+      cameraPhaseValue,
+      hasPermission,
+      measurementDeadline,
+      measurementFaceLocked,
+      measurementFaceRect,
+      measurementWindowCount,
+      prepareExerciseSession,
+      requestPermission,
+      rppgSampleCount,
+      rppgLastCollectTime,
+    ]),
   );
 
   React.useEffect(() => {
@@ -452,35 +961,208 @@ export const CameraScreen = () => {
     }
   }, [model]);
 
-  React.useEffect(() => {
-    if (rppgModel) {
-      console.log('rPPG model type:', typeof rppgModel);
-      console.log('rPPG model keys:', Object.keys(rppgModel));
-      try {
-        console.log('rPPG model delegate:', rppgModel.delegate);
-        console.log('rPPG model inputs:', rppgModel.inputs);
-        console.log('rPPG model outputs:', rppgModel.outputs);
-      } catch (e) {
-        console.error('Error accessing rPPG model metadata:', e);
-      }
-    }
-  }, [rppgModel]);
-
   const frameProcessor = useFrameProcessor(
     frame => {
       'worklet';
       if (model == null) return;
-
-      // 추론 빈도 제한: 200ms (약 5FPS)
       const currentTime = Date.now();
-      if (currentTime - lastLogTime.value < 250) return;
-      lastLogTime.value = currentTime;
 
       try {
         const orientation = frame.orientation;
+        const phase = cameraPhaseValue.value;
+
+        if (phase === 'pre-measuring' || phase === 'post-measuring') {
+          if (!measurementFaceLocked.value) {
+            if (currentTime - lastPoseInferenceTime.value < 200) {
+              return;
+            }
+            lastPoseInferenceTime.value = currentTime;
+
+            const isLandscape =
+              orientation === 'landscape-left' ||
+              orientation === 'landscape-right';
+            let rotation: '90deg' | '180deg' | '270deg' | undefined;
+            if (orientation === 'landscape-right') {
+              rotation = '90deg';
+            } else if (orientation === 'landscape-left') {
+              rotation = '270deg';
+            } else if (orientation === 'portrait-upside-down') {
+              rotation = '180deg';
+            }
+
+            const resized = resize(frame, {
+              scale: isLandscape
+                ? {width: MODEL_INPUT_HEIGHT, height: MODEL_INPUT_WIDTH}
+                : {width: MODEL_INPUT_WIDTH, height: MODEL_INPUT_HEIGHT},
+              ...(rotation && {rotation}),
+              ...(orientation === 'landscape-right' && {mirror: true}),
+              pixelFormat: 'rgb',
+              dataType: 'float32',
+            });
+
+            const outputs = model.runSync([resized]);
+            const flatOutput = outputs[0];
+            if (!flatOutput) return;
+
+            let bestConf = 0;
+            let bestBoxIdx = -1;
+            for (let i = 0; i < NUM_BOXES; i++) {
+              const conf = flatOutput[i * NUM_FEATURES + 4];
+              if (conf > bestConf && conf > CONF_THRESHOLD) {
+                bestConf = conf;
+                bestBoxIdx = i;
+              }
+            }
+
+            if (bestBoxIdx < 0) {
+              if (prevDetected.value) {
+                prevDetected.value = false;
+                flatKeypoints.value = [];
+                keypointsDirty.value = true;
+                detectedState.value = 2;
+              }
+              measurementFaceLocked.value = false;
+              measurementFaceRect.value = [];
+              measurementDeadline.value = 0;
+              rppgSampleCount.value = 0;
+              return;
+            }
+
+            const baseOffset = bestBoxIdx * NUM_FEATURES;
+            const flat: number[] = [];
+            for (let k = 0; k < 17; k++) {
+              const kpOffset = baseOffset + KP_START_IDX + k * 3;
+              flat.push(
+                flatOutput[kpOffset] as number,
+                flatOutput[kpOffset + 1] as number,
+                flatOutput[kpOffset + 2] as number,
+              );
+            }
+
+            flatKeypoints.value = flat;
+            keypointsDirty.value = true;
+
+            if (!prevDetected.value) {
+              prevDetected.value = true;
+              detectedState.value = 1;
+            }
+
+            const faceRect = getFaceRectFromKeypoints(flat);
+            if (faceRect == null) {
+              measurementFaceLocked.value = false;
+              measurementFaceRect.value = [];
+              measurementDeadline.value = 0;
+              rppgSampleCount.value = 0;
+              return;
+            }
+
+            const rppgRect = getRppgRoiFromFaceRect(faceRect);
+            measurementFaceRect.value = [
+              rppgRect.x,
+              rppgRect.y,
+              rppgRect.width,
+              rppgRect.height,
+            ];
+            measurementFaceLocked.value = true;
+            measurementDeadline.value = currentTime + MEASUREMENT_DURATION_MS;
+            measurementWindowCount.value = 0;
+            rppgSampleCount.value = 0;
+          }
+
+          if (
+            measurementDeadline.value > 0 &&
+            currentTime >= measurementDeadline.value
+          ) {
+            const completedWindows = measurementWindowCount.value;
+            measurementFaceLocked.value = false;
+            measurementFaceRect.value = [];
+            measurementDeadline.value = 0;
+            measurementWindowCount.value = 0;
+            rppgSampleCount.value = 0;
+            cameraPhaseValue.value =
+              phase === 'pre-measuring' ? 'workout' : 'results';
+            finishMeasurement(
+              phase === 'pre-measuring' ? 'pre' : 'post',
+              completedWindows,
+            );
+            return;
+          }
+
+          if (measurementFaceRect.value.length < 4) {
+            return;
+          }
+
+          if (currentTime - rppgLastCollectTime.value < RPPG_SAMPLE_INTERVAL_MS) {
+            return;
+          }
+          rppgLastCollectTime.value = currentTime;
+
+          // ── Face crop + RGB mean for CHROM rPPG ──
+          // measurementFaceRect는 정규화된 좌표 (0~1)
+          // resize plugin의 crop은 프레임 실제 픽셀 좌표를 기대한다
+          const fRect = measurementFaceRect.value;
+          const cropRect = getFrameCropFromModelRect(
+            {
+              x: fRect[0] as number,
+              y: fRect[1] as number,
+              width: fRect[2] as number,
+              height: fRect[3] as number,
+            },
+            orientation,
+            frame.width,
+            frame.height,
+          );
+          const cropX = Math.round(cropRect.x);
+          const cropY = Math.round(cropRect.y);
+          const cropW = Math.round(cropRect.width);
+          const cropH = Math.round(cropRect.height);
+
+          let faceRotation: '90deg' | '180deg' | '270deg' | undefined;
+          if (orientation === 'landscape-right') {
+            faceRotation = '90deg';
+          } else if (orientation === 'landscape-left') {
+            faceRotation = '270deg';
+          } else if (orientation === 'portrait-upside-down') {
+            faceRotation = '180deg';
+          }
+
+          const faceCropped = resize(frame, {
+            crop: {
+              x: cropX,
+              y: cropY,
+              width: Math.max(cropW, 1),
+              height: Math.max(cropH, 1),
+            },
+            scale: {width: RPPG_CROP_SIZE, height: RPPG_CROP_SIZE},
+            ...(faceRotation && {rotation: faceRotation}),
+            pixelFormat: 'rgb',
+            dataType: 'uint8',
+          });
+
+          measurementWindowCount.value += 1;
+          rppgSampleCount.value = measurementWindowCount.value;
+
+          const rgbMeans = calculateRgbMeans(faceCropped);
+          if (rgbMeans.length === 3) {
+            updateMeasurementVitals([
+              rgbMeans[0] as number,
+              rgbMeans[1] as number,
+              rgbMeans[2] as number,
+              currentTime,
+            ]);
+          }
+          return;
+        }
+
+        if (phase !== 'workout') {
+          return;
+        }
+
+        if (currentTime - lastPoseInferenceTime.value < 250) return;
+        lastPoseInferenceTime.value = currentTime;
+
         const isLandscape =
           orientation === 'landscape-left' || orientation === 'landscape-right';
-
         let rotation: '90deg' | '180deg' | '270deg' | undefined;
         if (orientation === 'landscape-right') {
           rotation = '90deg';
@@ -490,91 +1172,15 @@ export const CameraScreen = () => {
           rotation = '180deg';
         }
 
-        const needsImageMirror = orientation === 'landscape-right';
-
         const resized = resize(frame, {
           scale: isLandscape
-            ? { width: MODEL_INPUT_HEIGHT, height: MODEL_INPUT_WIDTH }
-            : { width: MODEL_INPUT_WIDTH, height: MODEL_INPUT_HEIGHT },
-          ...(rotation && { rotation }),
-          ...(needsImageMirror && { mirror: true }),
+            ? {width: MODEL_INPUT_HEIGHT, height: MODEL_INPUT_WIDTH}
+            : {width: MODEL_INPUT_WIDTH, height: MODEL_INPUT_HEIGHT},
+          ...(rotation && {rotation}),
+          ...(orientation === 'landscape-right' && {mirror: true}),
           pixelFormat: 'rgb',
           dataType: 'float32',
         });
-
-        // ── rPPG 연속 수집 ─────────────────────────────────────
-        // 전략: 250ms 간격으로 10프레임 배치를 계속 수집 (4Hz)
-        //       → 배치가 찰 때만 rPPG 추론
-        //       → 수집 프레임 일부는 Pose를 쉬게 해 순간 부하를 낮춤
-        // 이유: rPPG 모델은 BVP 신호를 추출하려면
-        //       최소 4Hz (Nyquist → 2Hz = 120BPM) 샘플 레이트 필요.
-        //       중간에 5초 쿨다운을 넣으면 BVP 히스토리가 실제로는
-        //       불연속인데 처리 로직은 연속 신호처럼 해석하게 된다.
-        // ⚠️ 사람이 감지된 경우에만 rPPG 수집 (노이즈 방지)
-        if (rppgModel != null && prevDetected.value) {
-          const timeSinceCollect =
-            currentTime - rppgLastCollectTime.value;
-
-          if (timeSinceCollect >= RPPG_SAMPLE_INTERVAL_MS) {
-            // worklet global에 배치 버퍼 유지 (1회만 할당, ~22MB)
-            // @ts-ignore – worklet global
-            if (!global.__rppgBatch) {
-              // @ts-ignore
-              global.__rppgBatch = new Float32Array(RPPG_BATCH_VALUES);
-            }
-            // @ts-ignore
-            const batch: Float32Array = global.__rppgBatch;
-
-            const frameSlot = rppgFrameSlot.value;
-            for (let pc = 0; pc < RPPG_FRAME_VALUES; pc++) {
-              batch[pc * RPPG_FRAME_COUNT + frameSlot] =
-                (resized[pc] as number) / 255;
-            }
-            rppgLastCollectTime.value = currentTime;
-
-            const nextSlot = frameSlot + 1;
-            if (nextSlot >= RPPG_FRAME_COUNT) {
-              // 10프레임 수집 완료 → rPPG 추론
-              const rppgOutputs = rppgModel.runSync([batch]);
-              const firstOutput = rppgOutputs[0];
-
-              // 디버그: 모델 출력 확인
-              if (RPPG_DEBUG_LOGGING) {
-                console.log(
-                  `[rPPG] inference done. outputs: ${rppgOutputs.length}, ` +
-                  `first length: ${firstOutput?.length ?? 0}, ` +
-                  `sample: [${firstOutput?.slice(0, 5).join(', ')}]`,
-                );
-              }
-
-              if (firstOutput != null && firstOutput.length > 0) {
-                const bvpValues: number[] = [];
-                for (let i = 0; i < firstOutput.length; i++) {
-                  bvpValues.push(firstOutput[i] as number);
-                }
-                updateRppgVitals(bvpValues);
-                updateRppgFrameProgress('분석 완료');
-              } else {
-                updateRppgFrameProgress('출력 없음');
-              }
-              rppgFrameSlot.value = 0;
-
-              // rPPG 추론 프레임만 Pose를 스킵해 CPU/GPU 피크를 줄인다.
-              return;
-            } else {
-              rppgFrameSlot.value = nextSlot;
-              if (nextSlot === 1 || nextSlot === 5 || nextSlot === 9) {
-                updateRppgFrameProgress(
-                  `수집 ${nextSlot}/${RPPG_FRAME_COUNT}`,
-                );
-              }
-
-              if (nextSlot % RPPG_POSE_SKIP_MODULO === 0) {
-                return;
-              }
-            }
-          }
-        }
 
         const outputs = model.runSync([resized]);
         const flatOutput = outputs[0];
@@ -629,15 +1235,11 @@ export const CameraScreen = () => {
             updateRepCount(repCount.value);
           }
         } else {
-          // 사람 없음 → rPPG 데이터도 초기화
           if (prevDetected.value) {
             prevDetected.value = false;
             flatKeypoints.value = [];
             keypointsDirty.value = true;
             detectedState.value = 2;
-            // rPPG 프레임 슬롯 리셋 (부분 축적 데이터 폐기)
-            rppgFrameSlot.value = 0;
-            updateRppgFrameProgress('사람 감지 필요');
           }
         }
       } catch (e: any) {
@@ -647,15 +1249,194 @@ export const CameraScreen = () => {
     },
     [
       activeExerciseId,
+      cameraPhaseValue,
+      finishMeasurement,
+      lastPoseInferenceTime,
+      measurementDeadline,
+      measurementFaceLocked,
+      measurementFaceRect,
+      measurementWindowCount,
       model,
-      rppgModel,
-      rppgFrameSlot,
+      rppgSampleCount,
       rppgLastCollectTime,
       updateRepCount,
-      updateRppgFrameProgress,
-      updateRppgVitals,
+      updateMeasurementVitals,
     ],
   );
+
+  const phaseTitle =
+    cameraPhase === 'pre-ready'
+      ? '운동 전 측정 준비'
+      : cameraPhase === 'pre-measuring'
+      ? '운동 전 안정 심박 측정'
+      : cameraPhase === 'post-ready'
+        ? '운동 후 측정 준비'
+      : cameraPhase === 'post-measuring'
+        ? '운동 후 회복 심박 측정'
+        : cameraPhase === 'results'
+          ? '회복 측정 결과'
+          : `${activeExercise.name} 자세 분석`;
+  const phaseBadge =
+    cameraPhase === 'pre-ready'
+      ? 'READY'
+      : cameraPhase === 'pre-measuring'
+      ? 'PRE CHECK'
+      : cameraPhase === 'post-ready'
+        ? 'READY'
+      : cameraPhase === 'post-measuring'
+        ? 'RECOVERY'
+        : cameraPhase === 'results'
+          ? 'RESULT'
+          : 'LIVE';
+  const coachTitle =
+    cameraPhase === 'pre-ready'
+      ? '카메라에 얼굴을 봐주세요'
+      : cameraPhase === 'pre-measuring'
+      ? '카메라를 보고 20초간 가만히 있어주세요'
+      : cameraPhase === 'post-ready'
+        ? '회복 측정을 시작할 준비가 되었어요'
+      : cameraPhase === 'post-measuring'
+        ? '운동이 끝났다면 회복 심박을 측정할게요'
+        : cameraPhase === 'results'
+          ? '운동 전후 심박 비교'
+        : counterGuide.coachTitle;
+  const preHeartRateDisplay =
+    preMeasurementVitals != null && preMeasurementVitals.heartRate > 0
+      ? preMeasurementVitals.heartRate
+      : '--';
+  const postHeartRateDisplay =
+    postMeasurementVitals != null && postMeasurementVitals.heartRate > 0
+      ? postMeasurementVitals.heartRate
+      : '--';
+  const coachGuide =
+    cameraPhase === 'pre-ready'
+      ? '안내를 확인한 뒤 버튼을 누르면 운동 전 rPPG 측정을 시작합니다.'
+      : cameraPhase === 'pre-measuring'
+      ? '얼굴이 안정적으로 잡히면 자동으로 측정이 시작됩니다.'
+      : cameraPhase === 'post-ready'
+        ? '버튼을 누른 뒤 카메라를 보고 가만히 있으면 운동 후 rPPG를 측정합니다.'
+      : cameraPhase === 'post-measuring'
+        ? '측정 중에는 시선을 카메라에 두고 움직임을 줄여주세요.'
+        : cameraPhase === 'results'
+          ? `운동 전 ${preHeartRateDisplay} BPM / 운동 후 ${postHeartRateDisplay} BPM`
+          : counterGuide.guideText;
+  const primaryButtonLabel =
+    cameraPhase === 'pre-ready'
+      ? '측정 시작'
+      : cameraPhase === 'workout'
+        ? isRppgEnabled
+          ? '운동 완료 후 회복 측정'
+          : '운동 완료로 기록'
+      : cameraPhase === 'post-ready'
+        ? '회복 측정 시작'
+      : cameraPhase === 'results'
+        ? '운동 완료로 기록'
+        : '측정 진행 중';
+  const primaryButtonDisabled =
+    cameraPhase === 'pre-measuring' || cameraPhase === 'post-measuring';
+
+  const handlePrimaryAction = useCallback(() => {
+    if (cameraPhase === 'pre-ready') {
+      startMeasurementPhase('pre');
+      return;
+    }
+
+    if (cameraPhase === 'workout') {
+      if (isRppgEnabled) {
+        startReadyPhase('post');
+      } else {
+        const didComplete = completeWorkout();
+        if (!didComplete) {
+          return;
+        }
+
+        const hasNextExercise =
+          currentExerciseIndex < workoutExerciseIds.length - 1;
+        if (hasNextExercise) {
+          const nextExerciseId = workoutExerciseIds[currentExerciseIndex + 1];
+          const nextExercise =
+            fallbackExercises.find(exercise => exercise.id === nextExerciseId) ??
+            fallbackExercises[0];
+
+          showAlert({
+            title: '운동 완료',
+            message: `${activeExercise.name} ${displayRepCount}회를 기록했어요.\n다음 운동 ${nextExercise.name}(으)로 이동할까요?`,
+            confirmText: '예',
+            cancelText: '아니오',
+            onConfirm: moveToNextExercise,
+            onCancel: finishWorkoutFlow,
+          });
+        } else {
+          showAlert({
+            title: '운동 완료',
+            message: `${activeExercise.name} ${displayRepCount}회를 기록했어요.\n선택한 운동을 모두 마쳤습니다.`,
+            confirmText: '확인',
+            onConfirm: finishWorkoutFlow,
+          });
+        }
+      }
+      return;
+    }
+
+    if (cameraPhase === 'post-ready') {
+      startMeasurementPhase('post');
+      return;
+    }
+
+    if (cameraPhase === 'results') {
+      const didComplete = completeWorkout();
+      if (!didComplete) {
+        return;
+      }
+
+      const hasNextExercise = currentExerciseIndex < workoutExerciseIds.length - 1;
+      if (hasNextExercise) {
+        const nextExerciseId = workoutExerciseIds[currentExerciseIndex + 1];
+        const nextExercise =
+          fallbackExercises.find(exercise => exercise.id === nextExerciseId) ??
+          fallbackExercises[0];
+
+        showAlert({
+          title: '운동 완료',
+          message: `${activeExercise.name} ${displayRepCount}회를 기록했어요.\n다음 운동 ${nextExercise.name}(으)로 이동할까요?`,
+          confirmText: '예',
+          cancelText: '아니오',
+          onConfirm: moveToNextExercise,
+          onCancel: finishWorkoutFlow,
+        });
+        return;
+      }
+
+      showAlert({
+        title: '운동 완료',
+        message: `${activeExercise.name} ${displayRepCount}회를 기록했어요.\n선택한 운동을 모두 마쳤습니다.`,
+        confirmText: '확인',
+        onConfirm: finishWorkoutFlow,
+      });
+    }
+  }, [
+    cameraPhase,
+    closeAlert,
+    completeWorkout,
+    currentExerciseIndex,
+    displayRepCount,
+    finishWorkoutFlow,
+    isRppgEnabled,
+    moveToNextExercise,
+    activeExercise,
+    startMeasurementPhase,
+    startReadyPhase,
+    showAlert,
+    workoutExerciseIds,
+  ]);
+
+  const resultDelta =
+    preMeasurementVitals?.heartRate != null &&
+    preMeasurementVitals.heartRate > 0 &&
+    postMeasurementVitals?.heartRate != null &&
+    postMeasurementVitals.heartRate > 0
+      ? postMeasurementVitals.heartRate - preMeasurementVitals.heartRate
+      : null;
 
   if (!hasPermission) {
     return (
@@ -710,6 +1491,7 @@ export const CameraScreen = () => {
         style={StyleSheet.absoluteFill}
         device={device}
         format={format}
+        fps={30}
         isActive={active}
         frameProcessor={frameProcessor}
       />
@@ -735,14 +1517,17 @@ export const CameraScreen = () => {
               AI CAMERA WORKOUT
             </TextR>
             <CameraTitle size={28} color={KINETIC_COLORS.onSurface}>
-              {activeExercise.name} 자세 분석
+              {phaseTitle}
             </CameraTitle>
+            <TextR size={12} color={KINETIC_COLORS.onSurfaceVariant}>
+              {`${currentExerciseIndex + 1}/${workoutExerciseIds.length}`}
+            </TextR>
           </TitleBlock>
 
           <LivePill>
             <LiveDot />
             <TextB size={12} color={KINETIC_COLORS.primary}>
-              LIVE
+              {phaseBadge}
             </TextB>
           </LivePill>
         </TitleRow>
@@ -766,19 +1551,25 @@ export const CameraScreen = () => {
             </CountValue>
           </CountCard>
         </HudMetrics>
-        <RppgVitalsHud
-          vitals={rppgVitals}
-          frameProgress={rppgFrameProgress}
-        />
+        {isRppgEnabled && (
+          <RppgVitalsHud
+            vitals={rppgVitals}
+            frameProgress={rppgFrameProgress}
+          />
+        )}
       </TopHud>
 
       <BottomCoachPanel>
         <CoachHeader>
           <CoachTitle size={17} color={KINETIC_COLORS.onSurface}>
-            {counterGuide.coachTitle}
+            {coachTitle}
           </CoachTitle>
           <TextR size={12} color={KINETIC_COLORS.onSurfaceVariant}>
-            10 FPS
+            {cameraPhase === 'results'
+              ? 'SUMMARY'
+              : isRppgEnabled
+                ? 'rPPG 10Hz'
+                : 'POSE AI'}
           </TextR>
         </CoachHeader>
         <ProgressTrack>
@@ -787,15 +1578,56 @@ export const CameraScreen = () => {
         <GuideRow>
           <GuideDot />
           <GuideText size={13} color={KINETIC_COLORS.onSurfaceVariant}>
-            {counterGuide.guideText}
+            {coachGuide}
           </GuideText>
         </GuideRow>
-        <CompleteWorkoutButton activeOpacity={0.88} onPress={completeWorkout}>
+        {cameraPhase === 'results' && (
+          <GuideRow>
+            <GuideDot />
+            <GuideText size={13} color={KINETIC_COLORS.onSurfaceVariant}>
+              {resultDelta == null
+                ? '심박 변화는 충분한 측정 데이터가 확보되면 표시됩니다.'
+                : `회복 변화 ${resultDelta > 0 ? '+' : ''}${resultDelta} BPM`}
+            </GuideText>
+          </GuideRow>
+        )}
+        <CompleteWorkoutButton
+          activeOpacity={0.88}
+          disabled={primaryButtonDisabled}
+          onPress={handlePrimaryAction}
+        >
           <TextB size={15} color="#000000">
-            운동 완료로 기록
+            {primaryButtonLabel}
           </TextB>
         </CompleteWorkoutButton>
+        {cameraPhase === 'post-ready' && (
+          <SecondaryActionButton
+            activeOpacity={0.88}
+            onPress={startResultsPhase}
+          >
+            <TextB size={15} color={KINETIC_COLORS.onSurface}>
+              회복 측정 건너뛰기
+            </TextB>
+          </SecondaryActionButton>
+        )}
       </BottomCoachPanel>
+      <CustomAlertModal
+        visible={alertConfig.visible}
+        title={alertConfig.title}
+        message={alertConfig.message}
+        confirmText={alertConfig.confirmText}
+        cancelText={alertConfig.cancelText}
+        onConfirm={() => {
+          alertConfig.onConfirm?.();
+        }}
+        onCancel={
+          alertConfig.onCancel
+            ? () => {
+                alertConfig.onCancel?.();
+              }
+            : undefined
+        }
+      />
     </Container>
   );
 };

@@ -2,10 +2,12 @@ import { createSlice, PayloadAction } from '@reduxjs/toolkit';
 
 interface AppState {
   isFirstLaunch: boolean;
+  isRppgEnabled: boolean;
 }
 
 const initialState: AppState = {
   isFirstLaunch: true,
+  isRppgEnabled: true,
 };
 
 const appSlice = createSlice({
@@ -15,8 +17,11 @@ const appSlice = createSlice({
     setFirstLaunch: (state, action: PayloadAction<boolean>) => {
       state.isFirstLaunch = action.payload;
     },
+    setRppgEnabled: (state, action: PayloadAction<boolean>) => {
+      state.isRppgEnabled = action.payload;
+    },
   },
 });
 
-export const { setFirstLaunch } = appSlice.actions;
+export const { setFirstLaunch, setRppgEnabled } = appSlice.actions;
 export default appSlice.reducer;

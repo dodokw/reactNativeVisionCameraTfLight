@@ -212,8 +212,8 @@ export const RppgVitalsHud: React.FC<RppgVitalsHudProps> = ({
         </VitalCard>
       </VitalsRow>
 
-      {/* BVP 파형 — 사람 감지 후 충분한 데이터가 있을 때만 표시 */}
-      {vitals && vitals.hasEnoughData && vitals.bvpWaveform.length >= 2 && (
+      {/* BVP 파형 — 데이터가 쌓이는 동안에도 표시 */}
+      {vitals && vitals.bvpWaveform.length >= 2 && (
         <WaveformCard>
           <WaveformHeader>
             <TextR size={11} color="rgba(255,255,255,0.55)">

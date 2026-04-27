@@ -9,14 +9,15 @@ import {
   View,
 } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
-import { useDispatch } from 'react-redux';
+import { useDispatch, useSelector } from 'react-redux';
 import styled from 'styled-components/native';
 import { Colors } from '../tools/Colors';
 import { TextB, TextR } from '../tools/fonts';
 import { RootStackNavigation, TabStackNavigation } from '../navigation/types';
 import { authApi } from '../api/auth';
 import { getApiErrorMessage } from '../api/client';
-import { AppDispatch } from '../store';
+import { AppDispatch, RootState } from '../store';
+import { setRppgEnabled } from '../store/slices/appSlice';
 import { clearUser } from '../store/slices/userSlice';
 
 const KINETIC_COLORS = Colors.kinetic;
@@ -43,6 +44,9 @@ export const AppSettingsScreen = () => {
   const navigation = useNavigation<TabStackNavigation>();
   const rootNavigation = navigation.getParent<RootStackNavigation>();
   const dispatch = useDispatch<AppDispatch>();
+  const isRppgEnabled = useSelector(
+    (state: RootState) => state.app.isRppgEnabled,
+  );
   const [highAccuracy, setHighAccuracy] = useState(true);
   const [mirrorPreview, setMirrorPreview] = useState(true);
   const [saveDebugLog, setSaveDebugLog] = useState(false);
@@ -170,6 +174,32 @@ export const AppSettingsScreen = () => {
             <Switch
               value={mirrorPreview}
               onValueChange={setMirrorPreview}
+              trackColor={{
+                false: KINETIC_COLORS.outline,
+                true: KINETIC_COLORS.primary,
+              }}
+              thumbColor="#ffffff"
+            />
+          </SwitchItem>
+
+          <Divider />
+
+          <SwitchItem>
+            <SwitchText>
+              <TextB size={17} color={KINETIC_COLORS.onSurface}>
+                rPPG 측정 사용
+              </TextB>
+              <DescriptionWrap>
+                <TextR size={13} color={KINETIC_COLORS.onSurfaceVariant}>
+                  카메라 화면에서 안내 확인 후 심박 측정을 진행합니다
+                </TextR>
+              </DescriptionWrap>
+            </SwitchText>
+            <Switch
+              value={isRppgEnabled}
+              onValueChange={value => {
+                dispatch(setRppgEnabled(value));
+              }}
               trackColor={{
                 false: KINETIC_COLORS.outline,
                 true: KINETIC_COLORS.primary,
